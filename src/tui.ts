@@ -2,14 +2,17 @@ import { randomUUID } from "node:crypto"
 
 import { Plugin } from "@opencode/plugin/tui"
 
-import { InteractiveTerminal } from "./rpc.js"
-import type { PendingTerminalRequest, TerminalRequest, TerminalResult } from "./rpc.js"
-import { resolveTerminal, runInTerminal } from "./terminal.js"
+import { InteractiveTerminal } from "./rpc.ts"
+import type { PendingTerminalRequest, TerminalRequest, TerminalResult } from "./rpc.ts"
+import { resolveTerminal, runInTerminal } from "./terminal.ts"
 
 interface ActiveRequest {
   controller: AbortController
   claimed: boolean
   timeout?: NodeJS.Timeout
+  result?: TerminalResult
+  delivering: boolean
+  delivered: boolean
 }
 
 function outputLimit(value: unknown): number {
@@ -45,9 +48,38 @@ export default Plugin.define({
       return response.accepted
     }
 
+    async function deliver(id: string, state: ActiveRequest): Promise<void> {
+      if (!state.result || state.delivering || state.delivered || stopping) return
+      state.delivering = true
+      try {
+        const accepted = await complete(id, state.result)
+        state.delivered = true
+        active.delete(id)
+        if (accepted) {
+          context.ui.toast.show({
+            title: "Interactive terminal",
+            message: state.result.error
+              ? state.result.error
+              : `Command finished with exit code ${state.result.exitCode ?? "unknown"}.`,
+            variant: state.result.error || state.result.exitCode !== 0 ? "warning" : "success",
+            duration: 3000,
+          })
+        }
+      } catch {
+        // Keep the original result; reconciliation retries after a transient failure.
+      } finally {
+        state.delivering = false
+      }
+    }
+
     async function run(request: TerminalRequest): Promise<void> {
       if (active.has(request.id)) return
-      const state: ActiveRequest = { controller: new AbortController(), claimed: false }
+      const state: ActiveRequest = {
+        controller: new AbortController(),
+        claimed: false,
+        delivering: false,
+        delivered: false,
+      }
       active.set(request.id, state)
 
       try {
@@ -55,13 +87,14 @@ export default Plugin.define({
         if (!claim.claimed) return
         state.claimed = true
         if (stopping || state.controller.signal.aborted) {
-          await complete(request.id, {
+          state.result = {
             output: "",
             exitCode: null,
             durationMs: 0,
             truncated: false,
             error: "Cancelled before the terminal was opened.",
-          }).catch(() => false)
+          }
+          await deliver(request.id, state)
           return
         }
 
@@ -75,37 +108,29 @@ export default Plugin.define({
           duration: 4000,
         })
 
-        const result = await runInTerminal(
+        state.result = await runInTerminal(
           request,
           terminal,
           maxOutputChars,
           state.controller.signal,
         )
-        const accepted = await complete(request.id, result)
-        if (accepted) {
-          context.ui.toast.show({
-            title: "Interactive terminal",
-            message: result.error
-              ? result.error
-              : `Command finished with exit code ${result.exitCode ?? "unknown"}.`,
-            variant: result.error || result.exitCode !== 0 ? "warning" : "success",
-            duration: 3000,
-          })
-        }
+        await deliver(request.id, state)
       } catch (error) {
-        if (state.claimed) {
-          await complete(request.id, {
+        if (state.claimed && !state.result) {
+          state.result = {
             output: "",
             exitCode: null,
             durationMs: 0,
             truncated: false,
             error: error instanceof Error ? error.message : String(error),
-          }).catch(() => false)
+          }
+          await deliver(request.id, state)
+        } else if (!state.claimed) {
+          showError(error)
         }
-        if (!state.controller.signal.aborted) showError(error)
       } finally {
         if (state.timeout) clearTimeout(state.timeout)
-        active.delete(request.id)
+        if (!state.result || state.delivered) active.delete(request.id)
       }
     }
 
@@ -119,10 +144,15 @@ export default Plugin.define({
           if (!request.claimed && !active.has(request.id)) void run(request)
         }
         for (const [id, state] of active) {
-          if (!present.has(id)) state.controller.abort()
+          if (!present.has(id)) {
+            if (state.result) active.delete(id)
+            else state.controller.abort()
+          } else if (state.result) {
+            void deliver(id, state)
+          }
         }
       } catch {
-        // Keep running commands during a disconnect; local deadlines still apply.
+        // Keep running commands and buffered results; local deadlines still apply.
       } finally {
         reconciling = false
       }

@@ -13,6 +13,27 @@ test("permission scanning includes commands nested in sh -lc", async () => {
   assert.ok(result.commands.some((resource) => /^rm\b/.test(resource)))
 })
 
+test("permission scanning handles shell options with separate arguments", async () => {
+  for (const options of [
+    ["-O", "extglob", "-c"],
+    ["--init-file", "/dev/null", "-c"],
+    ["--rcfile", "/dev/null", "-c"],
+  ]) {
+    const command = displayCommand("bash", [...options, "rm -- '*'"])
+    const result = await scanPermissions(command, process.cwd(), [process.cwd()])
+    assert.ok(
+      result.commands.some((resource) => /^rm\b/.test(resource)),
+      `missing nested rm in ${command}`,
+    )
+  }
+})
+
+test("recursive permission scanning preserves the shell dialect", async () => {
+  const command = displayCommand("zsh", ["-c", "print hi"])
+  const result = await scanPermissions(command, process.cwd(), [process.cwd()])
+  assert.ok(result.commands.some((resource) => /^print\b/.test(resource)))
+})
+
 test("external working directories and shell cd targets are checked", async () => {
   const directory = await mkdtemp(join(tmpdir(), "terminal-permissions-"))
   const project = join(directory, "project")

@@ -6,9 +6,10 @@ const limit = Math.max(4_096, Number(limitValue) || 240_000)
 const headLimit = Math.floor(limit / 2)
 const tailLimit = limit - headLimit
 const head = Buffer.alloc(headLimit)
+const tail = Buffer.alloc(tailLimit)
 let headLength = 0
-let tail: Buffer[] = []
 let tailLength = 0
+let tailStart = 0
 let total = 0
 let interrupted = false
 
@@ -17,6 +18,11 @@ for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) {
     interrupted = true
     process.stdin.destroy()
   })
+}
+
+function orderedTail(): Buffer {
+  if (tailLength < tailLimit || tailStart === 0) return tail.subarray(0, tailLength)
+  return Buffer.concat([tail.subarray(tailStart), tail.subarray(0, tailStart)])
 }
 
 try {
@@ -32,22 +38,27 @@ try {
       headLength += copied
     }
 
-    tail.push(chunk)
-    tailLength += chunk.length
-    while (tail.length > 1 && tailLength - tail[0].length >= tailLimit) {
-      tailLength -= tail[0].length
-      tail.shift()
-    }
-    if (tailLength > tailLimit) {
-      const excess = tailLength - tailLimit
-      tail[0] = tail[0].subarray(excess)
+    if (chunk.length >= tailLimit) {
+      chunk.copy(tail, 0, chunk.length - tailLimit)
       tailLength = tailLimit
+      tailStart = 0
+      continue
     }
+
+    const writeStart = (tailStart + tailLength) % tailLimit
+    const first = Math.min(chunk.length, tailLimit - writeStart)
+    chunk.copy(tail, writeStart, 0, first)
+    if (first < chunk.length) chunk.copy(tail, 0, first)
+
+    const combined = tailLength + chunk.length
+    if (combined > tailLimit) tailStart = (tailStart + combined - tailLimit) % tailLimit
+    tailLength = Math.min(combined, tailLimit)
   }
 } catch (error) {
   if (!interrupted) throw error
 }
 
+const bufferedTail = orderedTail()
 const truncated = total > limit
 let captured: Buffer
 if (truncated) {
@@ -55,12 +66,14 @@ if (truncated) {
   captured = Buffer.concat([
     head.subarray(0, headLength),
     Buffer.from(`\n\n[... ${omitted} captured bytes omitted ...]\n\n`),
-    ...tail,
+    bufferedTail,
   ])
-} else if (total <= tailLimit) {
-  captured = Buffer.concat(tail)
 } else {
-  captured = Buffer.concat([head.subarray(0, headLength), ...tail])
+  const remaining = total - headLength
+  captured = Buffer.concat([
+    head.subarray(0, headLength),
+    bufferedTail.subarray(bufferedTail.length - remaining),
+  ])
 }
 
 await writeFile(output, captured, { mode: 0o600 })

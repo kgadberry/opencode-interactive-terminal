@@ -3,9 +3,9 @@ import { resolve } from "node:path"
 
 import { Plugin } from "@opencode/plugin"
 
-import { displayCommand, scanPermissions } from "./permissions.js"
-import { InteractiveTerminal } from "./rpc.js"
-import type { TerminalRequest, TerminalResult } from "./rpc.js"
+import { displayCommand, scanPermissions } from "./permissions.ts"
+import { InteractiveTerminal } from "./rpc.ts"
+import type { TerminalRequest, TerminalResult } from "./rpc.ts"
 
 interface ToolInput {
   command: string
@@ -27,7 +27,7 @@ interface Pending {
 
 function numberOption(value: unknown, fallback: number, minimum: number, maximum: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback
-  return Math.min(maximum, Math.max(minimum, value))
+  return Math.min(maximum, Math.max(minimum, Math.ceil(value)))
 }
 
 export default Plugin.define({

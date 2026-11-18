@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import test from "node:test"
 
-import { runInTerminal } from "../src/terminal.ts"
+import { capOutput, runInTerminal } from "../src/terminal.ts"
 
 // Execute the same runner without opening a GUI window during automated tests.
 const direct = { command: "sh", args: ["-c", 'exec "$@"', "terminal-test"] }
@@ -22,6 +22,29 @@ async function fixture(
     terminal,
     60_000,
   )
+}
+
+async function startedPid(marker: string): Promise<number> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      const pid = Number((await readFile(marker, "utf8")).trim())
+      if (pid > 1) return pid
+    } catch {
+      // Wait for the command to start.
+    }
+    await delay(50)
+  }
+  throw new Error("Inner command did not start")
+}
+
+function processRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    const info = readFileSync(`/proc/${pid}/stat`, "utf8")
+    return !info.slice(info.lastIndexOf(")") + 2).startsWith("Z")
+  } catch {
+    return false
+  }
 }
 
 test("captures stdout and stderr through a PTY and returns the exact exit code", async () => {
@@ -91,6 +114,27 @@ test("bounded capture does not kill a verbose successful command", async () => {
   assert.ok(result.output.length <= 1_000)
 })
 
+test("collector preserves byte order around the head/tail threshold", async () => {
+  const expected = Array.from({ length: 6_000 }, (_, index) => index % 10).join("")
+  const result = await runInTerminal(
+    {
+      id: "ordered-output",
+      command: "node",
+      args: [
+        "-e",
+        "process.stdout.write(Array.from({ length: 6000 }, (_, i) => i % 10).join(''))",
+      ],
+      cwd: process.cwd(),
+      title: "Ordered output",
+      timeoutMs: 60_000,
+    },
+    direct,
+    2_000,
+  )
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.output, capOutput(expected, 2_000).text)
+})
+
 test("cancellation kills an inner command that ignores HUP and SIGTERM", async () => {
   const directory = await mkdtemp(join(tmpdir(), "interactive-terminal-cancel-"))
   const marker = join(directory, "pid")
@@ -115,31 +159,48 @@ test("cancellation kills an inner command that ignores HUP and SIGTERM", async (
   )
 
   try {
-    let pid = 0
-    for (let attempt = 0; attempt < 100; attempt++) {
-      try {
-        pid = Number((await readFile(marker, "utf8")).trim())
-        if (pid > 1) break
-      } catch {
-        // Wait for the command to start.
-      }
-      await delay(50)
-    }
-    assert.ok(pid > 1, "inner command did not start")
-
+    const pid = await startedPid(marker)
     controller.abort()
     const result = await runningCommand
     assert.equal(result.error, "Cancelled by OpenCode.")
+    assert.equal(processRunning(pid), false, `inner command ${pid} survived cancellation`)
+  } finally {
+    controller.abort()
+    await runningCommand
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
-    let alive = true
-    try {
-      process.kill(pid, 0)
-      const info = readFileSync(`/proc/${pid}/stat`, "utf8")
-      alive = !info.slice(info.lastIndexOf(")") + 2).startsWith("Z")
-    } catch {
-      alive = false
-    }
-    assert.equal(alive, false, `inner command ${pid} survived cancellation`)
+test("cancellation kills a resistant child after its group leader exits", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "interactive-terminal-group-"))
+  const marker = join(directory, "pid")
+  const controller = new AbortController()
+  const runningCommand = runInTerminal(
+    {
+      id: "cancel-group",
+      command: "sh",
+      args: [
+        "-c",
+        'sh -c "$1" & child=$!; printf "%s\\n" "$child" >"$2"; wait "$child"',
+        "sh",
+        'trap "" HUP TERM; while :; do sleep 1; done',
+        marker,
+      ],
+      cwd: process.cwd(),
+      title: "Group cancellation test",
+      timeoutMs: 60_000,
+    },
+    direct,
+    60_000,
+    controller.signal,
+  )
+
+  try {
+    const pid = await startedPid(marker)
+    controller.abort()
+    const result = await runningCommand
+    assert.equal(result.error, "Cancelled by OpenCode.")
+    assert.equal(processRunning(pid), false, `child process ${pid} survived cancellation`)
   } finally {
     controller.abort()
     await runningCommand

@@ -1,13 +1,13 @@
 import { spawn } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 
-import type { TerminalRequest, TerminalResult } from "./rpc.js"
+import type { TerminalRequest, TerminalResult } from "./rpc.ts"
 
 export interface TerminalSpec {
   command: string
@@ -142,25 +142,32 @@ function commandPid(path: string): number | undefined {
   }
 }
 
-function running(pid: number): boolean {
+function groupRunning(pgid: number): boolean {
   try {
-    process.kill(pid, 0)
-  } catch {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue
+      try {
+        const info = readFileSync(`/proc/${entry}/stat`, "utf8")
+        const fields = info.slice(info.lastIndexOf(")") + 2).split(" ")
+        if (Number(fields[2]) === pgid && fields[0] !== "Z") return true
+      } catch {
+        // Processes can exit while /proc is being inspected.
+      }
+    }
     return false
-  }
-
-  // kill(pid, 0) also succeeds for an unreaped zombie on Linux.
-  try {
-    const info = readFileSync(`/proc/${pid}/stat`, "utf8")
-    return info.slice(info.lastIndexOf(")") + 2).startsWith("Z") === false
   } catch {
-    return true
+    try {
+      process.kill(-pgid, 0)
+      return true
+    } catch {
+      return false
+    }
   }
 }
 
-async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+async function waitForGroupExit(pgid: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
-  while (running(pid)) {
+  while (groupRunning(pgid)) {
     if (Date.now() >= deadline) return false
     await delay(50)
   }
@@ -284,12 +291,12 @@ export async function runInTerminal(
 
     const initialStatus = await readIfPresent(statusPath)
     const pid = commandPid(commandPidPath)
-    if (!initialStatus && pid) {
-      // A closed launcher is not proof that script's inner session has exited.
+    if (pid && (cancelled || !initialStatus)) {
+      // A closed launcher or dead group leader does not prove the group is empty.
       signalGroup(pid, "SIGTERM")
-      if (!(await waitForExit(pid, 5_000))) {
+      if (!(await waitForGroupExit(pid, 5_000))) {
         signalGroup(pid, "SIGKILL")
-        await waitForExit(pid, 5_000)
+        await waitForGroupExit(pid, 5_000)
       }
     }
     if (!initialStatus) await waitForFile(outputPath, 1_000)

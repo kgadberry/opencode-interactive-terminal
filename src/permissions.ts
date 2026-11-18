@@ -40,31 +40,56 @@ interface ParsedCommands {
   directories: string[]
 }
 
-function embeddedScripts(command: string): string[] {
-  const scanned = ShellScan.scan(command, "posix")
+type Dialect = "bash" | "zsh" | "posix"
+
+interface EmbeddedScript {
+  text: string
+  shell: string
+}
+
+function dialect(shell: string): Dialect {
+  const name = basename(shell)
+  return name === "bash" || name === "zsh" ? name : "posix"
+}
+
+function embeddedScripts(command: string, shell: string): EmbeddedScript[] {
+  const scanned = ShellScan.scan(command, dialect(shell))
   if (scanned.kind === "opaque") {
     throw new Error(`OpenCode's shell scanner cannot analyze command: ${scanned.reason}`)
   }
 
   return scanned.commands.flatMap((item) => {
     const words = item.words
-    if (!["sh", "bash", "zsh"].includes(basename(words[0] ?? ""))) return []
+    const executable = words[0] ?? ""
+    if (!["sh", "bash", "zsh"].includes(basename(executable))) return []
     for (let index = 1; index < words.length - 1; index++) {
       const word = words[index]
       if (word === "--command" || /^-[A-Za-z]*c[A-Za-z]*$/.test(word)) {
-        return [words[index + 1]]
+        return [{ text: words[index + 1], shell: executable }]
       }
-      if (!word.startsWith("-")) break
+      if (["-O", "+O", "-o", "--init-file", "--rcfile"].includes(word)) {
+        index++
+        continue
+      }
+      if (word === "--") break
+      if (!word.startsWith("-") && !word.startsWith("+")) break
     }
     return []
   })
 }
 
-async function scanCommands(command: string, cwd: string, depth = 0): Promise<ParsedCommands> {
+async function scanCommands(
+  command: string,
+  cwd: string,
+  shell = "sh",
+  depth = 0,
+): Promise<ParsedCommands> {
   if (depth > 10) throw new Error("Embedded shell command nesting exceeds the scanner limit.")
-  const parsed = await Effect.runPromise(ShellParse.scanPortable(command, "/bin/sh", cwd))
+  const parsed = await Effect.runPromise(ShellParse.scanPortable(command, shell, cwd))
   const nested = await Promise.all(
-    embeddedScripts(command).map((script) => scanCommands(script, cwd, depth + 1)),
+    embeddedScripts(command, shell).map((script) =>
+      scanCommands(script.text, cwd, script.shell, depth + 1),
+    ),
   )
   return {
     commands: [...parsed.commands.map((item) => item.resource), ...nested.flatMap((item) => item.commands)],
