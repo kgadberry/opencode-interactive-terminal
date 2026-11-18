@@ -1,0 +1,252 @@
+import { spawn } from "node:child_process"
+import type { ChildProcess } from "node:child_process"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { basename, join } from "node:path"
+import { fileURLToPath } from "node:url"
+
+import type { TerminalRequest, TerminalResult } from "./rpc.js"
+
+export interface TerminalSpec {
+  command: string
+  args: string[]
+}
+
+const runner = fileURLToPath(new URL("./runner.sh", import.meta.url))
+
+const presets: Record<string, string[]> = {
+  kitty: ["--class", "opencode-interactive-terminal", "--title", "{title}"],
+  ghostty: ["--class=opencode-interactive-terminal", "--title={title}", "-e"],
+  wezterm: ["start", "--"],
+  alacritty: ["--class", "opencode-interactive-terminal", "--title", "{title}", "-e"],
+  foot: ["--app-id", "opencode-interactive-terminal", "--title", "{title}", "--"],
+  xterm: ["-class", "opencode-interactive-terminal", "-title", "{title}", "-e"],
+}
+
+function configuredTerminal(value: unknown): TerminalSpec | undefined {
+  if (value === undefined) return
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("The terminal option must be an object with command and args fields.")
+  }
+  const candidate = value as { command?: unknown; args?: unknown }
+  if (typeof candidate.command !== "string" || candidate.command.length === 0) {
+    throw new Error("The terminal.command option must be a non-empty string.")
+  }
+  if (
+    candidate.args !== undefined &&
+    (!Array.isArray(candidate.args) || candidate.args.some((arg) => typeof arg !== "string"))
+  ) {
+    throw new Error("The terminal.args option must be an array of strings.")
+  }
+  return { command: candidate.command, args: candidate.args ?? [] }
+}
+
+export function resolveTerminal(options: unknown, env: NodeJS.ProcessEnv = process.env): TerminalSpec {
+  const configured = configuredTerminal(
+    typeof options === "object" && options !== null
+      ? (options as { terminal?: unknown }).terminal
+      : undefined,
+  )
+  if (configured) return configured
+
+  const selected = env.TERMINAL || env.TERM_PROGRAM || "kitty"
+  const name = basename(selected).toLowerCase().replace(/\.exe$/, "")
+  const known = Object.keys(presets).find((candidate) => name.includes(candidate))
+  return {
+    command: known ?? selected,
+    args: known ? [...presets[known]] : ["-e"],
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+function removeScriptMetadata(raw: string): string {
+  let text = raw
+  if (text.startsWith("Script started on ")) {
+    const end = text.indexOf("\n")
+    text = end === -1 ? "" : text.slice(end + 1)
+  }
+
+  const footer = text.lastIndexOf("\nScript done on ")
+  if (footer !== -1 && /^\nScript done on [^\n]*\n?$/.test(text.slice(footer))) {
+    text = text.slice(0, footer)
+  }
+  return text
+}
+
+export function cleanOutput(raw: string): string {
+  let text = removeScriptMetadata(raw)
+    // OSC sequences set titles and clipboard contents; they are not command output text.
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+    // CSI sequences control cursor movement, colour, erasing, and other terminal state.
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-_]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+
+  let plain = ""
+  for (const character of text) {
+    if (character === "\b") plain = plain.slice(0, -1)
+    else plain += character
+  }
+
+  return plain.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+}
+
+export function capOutput(
+  text: string,
+  maximum: number,
+): { text: string; truncated: boolean } {
+  if (text.length <= maximum) return { text, truncated: false }
+
+  const marker = "\n\n[... characters omitted ...]\n\n"
+  const available = maximum - marker.length
+  if (available < 2) return { text: text.slice(-maximum), truncated: true }
+
+  const headLength = Math.floor(available / 4)
+  const tailLength = available - headLength
+  return {
+    text: `${text.slice(0, headLength)}${marker}${text.slice(-tailLength)}`,
+    truncated: true,
+  }
+}
+
+function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (!child.pid) return
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    try {
+      child.kill(signal)
+    } catch {
+      // The terminal has already exited.
+    }
+  }
+}
+
+async function readIfPresent(path: string): Promise<string> {
+  try {
+    return await readFile(path, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return ""
+    throw error
+  }
+}
+
+export async function runInTerminal(
+  request: TerminalRequest,
+  terminal: TerminalSpec,
+  maxOutputChars: number,
+  signal?: AbortSignal,
+): Promise<TerminalResult> {
+  const started = Date.now()
+  if (signal?.aborted) {
+    return {
+      output: "",
+      exitCode: null,
+      durationMs: 0,
+      truncated: false,
+      error: "Cancelled before the terminal was opened.",
+    }
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), "opencode-interactive-terminal-"))
+  const outputPath = join(directory, "output.log")
+  const statusPath = join(directory, "status")
+  const commandPath = join(directory, "command.sh")
+  let child: ChildProcess | undefined
+  let forceKill: NodeJS.Timeout | undefined
+  let cancel: (() => void) | undefined
+
+  try {
+    const command = [request.command, ...request.args].map(shellQuote).join(" ")
+    await writeFile(commandPath, `#!/bin/sh\nexec ${command}\n`, { mode: 0o600 })
+
+    const terminalArgs = terminal.args.map((arg) => arg.replaceAll("{title}", request.title))
+    const args = [
+      ...terminalArgs,
+      "sh",
+      runner,
+      outputPath,
+      statusPath,
+      request.cwd,
+      commandPath,
+    ]
+
+    child = spawn(terminal.command, args, {
+      detached: process.platform !== "win32",
+      stdio: "ignore",
+    })
+
+    let cancelled = false
+    cancel = () => {
+      cancelled = true
+      signalProcessGroup(child!, "SIGTERM")
+      forceKill = setTimeout(() => signalProcessGroup(child!, "SIGKILL"), 5_000)
+      forceKill.unref()
+    }
+    signal?.addEventListener("abort", cancel, { once: true })
+    if (signal?.aborted) cancel()
+
+    const outcome = await new Promise<{
+      code: number | null
+      signal: NodeJS.Signals | null
+      error?: Error
+    }>((resolve) => {
+      let settled = false
+      child!.once("error", (error) => {
+        if (settled) return
+        settled = true
+        resolve({ code: null, signal: null, error })
+      })
+      child!.once("close", (code, childSignal) => {
+        if (forceKill) clearTimeout(forceKill)
+        if (settled) return
+        settled = true
+        resolve({ code, signal: childSignal })
+      })
+    })
+    signal?.removeEventListener("abort", cancel)
+
+    const [rawOutput, rawStatus] = await Promise.all([
+      readIfPresent(outputPath),
+      readIfPresent(statusPath),
+    ])
+    const captured = capOutput(cleanOutput(rawOutput), maxOutputChars)
+    const status = rawStatus.trim()
+    const exitCode = /^\d{1,3}$/.test(status) ? Number(status) : null
+
+    let error: string | undefined
+    if (outcome.error) error = `Could not open the terminal: ${outcome.error.message}`
+    else if (cancelled) error = "Cancelled by OpenCode."
+    else if (exitCode === null) {
+      const reason = outcome.signal
+        ? `signal ${outcome.signal}`
+        : `exit code ${outcome.code ?? "unknown"}`
+      error = `The terminal closed without a command status (${reason}).`
+    }
+
+    return {
+      output: captured.text,
+      exitCode,
+      durationMs: Date.now() - started,
+      truncated: captured.truncated,
+      error,
+    }
+  } catch (error) {
+    if (child) signalProcessGroup(child, "SIGTERM")
+    return {
+      output: "",
+      exitCode: null,
+      durationMs: Date.now() - started,
+      truncated: false,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  } finally {
+    if (forceKill) clearTimeout(forceKill)
+    if (signal && cancel) signal.removeEventListener("abort", cancel)
+    await rm(directory, { recursive: true, force: true })
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "opencode-interactive-terminal",
+  "version": "0.1.0",
+  "description": "Run agent commands in a user-facing interactive terminal and return captured output to OpenCode.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.ts",
+    "./rpc": "./src/rpc.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "terminal",
+    "pty"
+  ],
+  "license": "CC0-1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kgadberry/opencode-interactive-terminal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kgadberry/opencode-interactive-terminal/issues"
+  }
+}
