@@ -1,8 +1,41 @@
 import { Rpc } from "@opencode/plugin/rpc"
 
+const requestProperties = {
+  id: { type: "string" },
+  command: { type: "string" },
+  args: { type: "array", items: { type: "string" } },
+  cwd: { type: "string" },
+  title: { type: "string" },
+  timeoutMs: { type: "integer", minimum: 1 },
+} as const
+
+const requestRequired = ["id", "command", "args", "cwd", "title", "timeoutMs"] as const
+
 export const InteractiveTerminal = Rpc.define({
   id: "interactive-terminal",
   methods: {
+    pending: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: {
+          requests: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                ...requestProperties,
+                claimed: { type: "boolean" },
+              },
+              required: [...requestRequired, "claimed"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["requests"],
+        additionalProperties: false,
+      },
+    },
     claim: {
       input: {
         type: "object",
@@ -43,30 +76,7 @@ export const InteractiveTerminal = Rpc.define({
       },
     },
   },
-  events: {
-    requested: {
-      schema: {
-        type: "object",
-        properties: {
-          id: { type: "string" },
-          command: { type: "string" },
-          args: { type: "array", items: { type: "string" } },
-          cwd: { type: "string" },
-          title: { type: "string" },
-        },
-        required: ["id", "command", "args", "cwd", "title"],
-        additionalProperties: false,
-      },
-    },
-    cancelled: {
-      schema: {
-        type: "object",
-        properties: { id: { type: "string" } },
-        required: ["id"],
-        additionalProperties: false,
-      },
-    },
-  },
+  events: {},
 })
 
 export interface TerminalRequest {
@@ -75,6 +85,11 @@ export interface TerminalRequest {
   args: string[]
   cwd: string
   title: string
+  timeoutMs: number
+}
+
+export interface PendingTerminalRequest extends TerminalRequest {
+  claimed: boolean
 }
 
 export interface TerminalResult {

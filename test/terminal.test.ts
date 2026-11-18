@@ -1,7 +1,9 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm } from "node:fs/promises"
+import { readFileSync } from "node:fs"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 import test from "node:test"
 
 import { runInTerminal } from "../src/terminal.ts"
@@ -16,7 +18,7 @@ async function fixture(
   terminal = direct,
 ) {
   return runInTerminal(
-    { id: "test", command, args, cwd, title: "Test" },
+    { id: "test", command, args, cwd, title: "Test", timeoutMs: 60_000 },
     terminal,
     60_000,
   )
@@ -69,4 +71,78 @@ test("reports terminal launch failures", async () => {
   })
   assert.equal(result.exitCode, null)
   assert.match(result.error ?? "", /Could not open the terminal/)
+})
+
+test("bounded capture does not kill a verbose successful command", async () => {
+  const result = await runInTerminal(
+    {
+      id: "large-output",
+      command: "node",
+      args: ["-e", "process.stdout.write('x'.repeat(1_000_000))"],
+      cwd: process.cwd(),
+      title: "Large output",
+      timeoutMs: 60_000,
+    },
+    direct,
+    1_000,
+  )
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.truncated, true)
+  assert.ok(result.output.length <= 1_000)
+})
+
+test("cancellation kills an inner command that ignores HUP and SIGTERM", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "interactive-terminal-cancel-"))
+  const marker = join(directory, "pid")
+  const controller = new AbortController()
+  const runningCommand = runInTerminal(
+    {
+      id: "cancel",
+      command: "sh",
+      args: [
+        "-c",
+        'trap "" HUP TERM; printf "%s\\n" "$$" >"$1"; while :; do sleep 1; done',
+        "sh",
+        marker,
+      ],
+      cwd: process.cwd(),
+      title: "Cancellation test",
+      timeoutMs: 60_000,
+    },
+    direct,
+    60_000,
+    controller.signal,
+  )
+
+  try {
+    let pid = 0
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        pid = Number((await readFile(marker, "utf8")).trim())
+        if (pid > 1) break
+      } catch {
+        // Wait for the command to start.
+      }
+      await delay(50)
+    }
+    assert.ok(pid > 1, "inner command did not start")
+
+    controller.abort()
+    const result = await runningCommand
+    assert.equal(result.error, "Cancelled by OpenCode.")
+
+    let alive = true
+    try {
+      process.kill(pid, 0)
+      const info = readFileSync(`/proc/${pid}/stat`, "utf8")
+      alive = !info.slice(info.lastIndexOf(")") + 2).startsWith("Z")
+    } catch {
+      alive = false
+    }
+    assert.equal(alive, false, `inner command ${pid} survived cancellation`)
+  } finally {
+    controller.abort()
+    await runningCommand
+    await rm(directory, { recursive: true, force: true })
+  }
 })

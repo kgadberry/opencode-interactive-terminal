@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { readFileSync } from "node:fs"
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
 
 import type { TerminalRequest, TerminalResult } from "./rpc.js"
@@ -13,11 +15,12 @@ export interface TerminalSpec {
 }
 
 const runner = fileURLToPath(new URL("./runner.sh", import.meta.url))
+const collector = fileURLToPath(new URL("./collector.ts", import.meta.url))
 
 const presets: Record<string, string[]> = {
   kitty: ["--class", "opencode-interactive-terminal", "--title", "{title}"],
   ghostty: ["--class=opencode-interactive-terminal", "--title={title}", "-e"],
-  wezterm: ["start", "--"],
+  wezterm: ["start", "--always-new-process", "--"],
   alacritty: ["--class", "opencode-interactive-terminal", "--title", "{title}", "-e"],
   foot: ["--app-id", "opencode-interactive-terminal", "--title", "{title}", "--"],
   xterm: ["-class", "opencode-interactive-terminal", "-title", "{title}", "-e"],
@@ -113,17 +116,55 @@ export function capOutput(
   }
 }
 
-function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (!child.pid) return
+function signalGroup(pid: number, signal: NodeJS.Signals): void {
+  if (!Number.isInteger(pid) || pid <= 1) return
   try {
-    process.kill(-child.pid, signal)
+    process.kill(-pid, signal)
   } catch {
     try {
-      child.kill(signal)
+      process.kill(pid, signal)
     } catch {
-      // The terminal has already exited.
+      // The process has already exited.
     }
   }
+}
+
+function signalLauncher(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid) signalGroup(child.pid, signal)
+}
+
+function commandPid(path: string): number | undefined {
+  try {
+    const value = Number(readFileSync(path, "utf8").trim())
+    return Number.isInteger(value) && value > 1 ? value : undefined
+  } catch {
+    return
+  }
+}
+
+function running(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+  } catch {
+    return false
+  }
+
+  // kill(pid, 0) also succeeds for an unreaped zombie on Linux.
+  try {
+    const info = readFileSync(`/proc/${pid}/stat`, "utf8")
+    return info.slice(info.lastIndexOf(")") + 2).startsWith("Z") === false
+  } catch {
+    return true
+  }
+}
+
+async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (running(pid)) {
+    if (Date.now() >= deadline) return false
+    await delay(50)
+  }
+  return true
 }
 
 async function readIfPresent(path: string): Promise<string> {
@@ -132,6 +173,19 @@ async function readIfPresent(path: string): Promise<string> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return ""
     throw error
+  }
+}
+
+async function waitForFile(path: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    try {
+      await stat(path)
+      return
+    } catch {
+      if (Date.now() >= deadline) return
+      await delay(50)
+    }
   }
 }
 
@@ -156,15 +210,27 @@ export async function runInTerminal(
   const outputPath = join(directory, "output.log")
   const statusPath = join(directory, "status")
   const commandPath = join(directory, "command.sh")
+  const commandPidPath = join(directory, "command.pid")
   let child: ChildProcess | undefined
   let forceKill: NodeJS.Timeout | undefined
   let cancel: (() => void) | undefined
+  let cancelled = false
+
+  const signalCommand = (signal: NodeJS.Signals) => {
+    const pid = commandPid(commandPidPath)
+    if (pid) signalGroup(pid, signal)
+  }
 
   try {
     const command = [request.command, ...request.args].map(shellQuote).join(" ")
-    await writeFile(commandPath, `#!/bin/sh\nexec ${command}\n`, { mode: 0o600 })
+    await writeFile(
+      commandPath,
+      `#!/bin/sh\nset -e\nprintf '%s\\n' "$$" >"$COMMAND_PID_FILE"\nexec ${command}\n`,
+      { mode: 0o600 },
+    )
 
     const terminalArgs = terminal.args.map((arg) => arg.replaceAll("{title}", request.title))
+    const captureLimit = Math.max(4_096, maxOutputChars * 4)
     const args = [
       ...terminalArgs,
       "sh",
@@ -173,6 +239,9 @@ export async function runInTerminal(
       statusPath,
       request.cwd,
       commandPath,
+      commandPidPath,
+      collector,
+      String(captureLimit),
     ]
 
     child = spawn(terminal.command, args, {
@@ -180,11 +249,15 @@ export async function runInTerminal(
       stdio: "ignore",
     })
 
-    let cancelled = false
     cancel = () => {
+      if (cancelled) return
       cancelled = true
-      signalProcessGroup(child!, "SIGTERM")
-      forceKill = setTimeout(() => signalProcessGroup(child!, "SIGKILL"), 5_000)
+      signalCommand("SIGTERM")
+      signalLauncher(child!, "SIGTERM")
+      forceKill = setTimeout(() => {
+        signalCommand("SIGKILL")
+        signalLauncher(child!, "SIGKILL")
+      }, 5_000)
       forceKill.unref()
     }
     signal?.addEventListener("abort", cancel, { once: true })
@@ -202,7 +275,6 @@ export async function runInTerminal(
         resolve({ code: null, signal: null, error })
       })
       child!.once("close", (code, childSignal) => {
-        if (forceKill) clearTimeout(forceKill)
         if (settled) return
         settled = true
         resolve({ code, signal: childSignal })
@@ -210,9 +282,22 @@ export async function runInTerminal(
     })
     signal?.removeEventListener("abort", cancel)
 
-    const [rawOutput, rawStatus] = await Promise.all([
+    const initialStatus = await readIfPresent(statusPath)
+    const pid = commandPid(commandPidPath)
+    if (!initialStatus && pid) {
+      // A closed launcher is not proof that script's inner session has exited.
+      signalGroup(pid, "SIGTERM")
+      if (!(await waitForExit(pid, 5_000))) {
+        signalGroup(pid, "SIGKILL")
+        await waitForExit(pid, 5_000)
+      }
+    }
+    if (!initialStatus) await waitForFile(outputPath, 1_000)
+
+    const [rawOutput, rawStatus, captureTruncated] = await Promise.all([
       readIfPresent(outputPath),
       readIfPresent(statusPath),
+      readIfPresent(`${outputPath}.truncated`),
     ])
     const captured = capOutput(cleanOutput(rawOutput), maxOutputChars)
     const status = rawStatus.trim()
@@ -232,11 +317,12 @@ export async function runInTerminal(
       output: captured.text,
       exitCode,
       durationMs: Date.now() - started,
-      truncated: captured.truncated,
+      truncated: captured.truncated || captureTruncated.length > 0,
       error,
     }
   } catch (error) {
-    if (child) signalProcessGroup(child, "SIGTERM")
+    signalCommand("SIGKILL")
+    if (child) signalLauncher(child, "SIGTERM")
     return {
       output: "",
       exitCode: null,

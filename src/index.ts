@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto"
-import { isAbsolute, resolve } from "node:path"
+import { resolve } from "node:path"
 
 import { Plugin } from "@opencode/plugin"
 
+import { displayCommand, scanPermissions } from "./permissions.js"
 import { InteractiveTerminal } from "./rpc.js"
 import type { TerminalRequest, TerminalResult } from "./rpc.js"
 
@@ -14,9 +15,8 @@ interface ToolInput {
 }
 
 interface Pending {
-  id: string
+  request: TerminalRequest
   client?: string
-  timeoutMs: number
   startTimer: NodeJS.Timeout
   timeoutTimer?: NodeJS.Timeout
   signal: AbortSignal
@@ -30,14 +30,6 @@ function numberOption(value: unknown, fallback: number, minimum: number, maximum
   return Math.min(maximum, Math.max(minimum, value))
 }
 
-function quote(value: string): string {
-  return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'"'"'`)}'`
-}
-
-export function displayCommand(command: string, args: string[] = []): string {
-  return [command, ...args].map(quote).join(" ")
-}
-
 export default Plugin.define({
   id: "interactive-terminal",
   async setup(ctx) {
@@ -45,7 +37,13 @@ export default Plugin.define({
     const defaultTimeout = numberOption(ctx.options.timeout, 1_800, 1, 86_400)
     const startTimeout = numberOption(ctx.options.startTimeout, 15, 1, 300)
 
-    const registration = await ctx.rpc.register(InteractiveTerminal, {
+    await ctx.rpc.register(InteractiveTerminal, {
+      pending: async () => ({
+        requests: [...requests.values()].map((pending) => ({
+          ...pending.request,
+          claimed: pending.client !== undefined,
+        })),
+      }),
       claim: async (input) => {
         const { id, client } = input as { id: string; client: string }
         const pending = requests.get(id)
@@ -54,8 +52,11 @@ export default Plugin.define({
         pending.client = client
         clearTimeout(pending.startTimer)
         pending.timeoutTimer = setTimeout(() => {
-          fail(pending, `Interactive terminal command timed out after ${pending.timeoutMs / 1000} seconds.`)
-        }, pending.timeoutMs)
+          fail(
+            pending,
+            `Interactive terminal command timed out after ${pending.request.timeoutMs / 1000} seconds.`,
+          )
+        }, pending.request.timeoutMs)
         return { claimed: true }
       },
       complete: async (input) => {
@@ -64,7 +65,7 @@ export default Plugin.define({
         if (!pending || pending.client !== value.client) return { accepted: false }
 
         cleanup(pending)
-        requests.delete(pending.id)
+        requests.delete(pending.request.id)
         pending.resolve({
           output: value.output,
           exitCode: value.exitCode,
@@ -83,23 +84,20 @@ export default Plugin.define({
     }
 
     function fail(pending: Pending, message: string): void {
-      if (requests.get(pending.id) !== pending) return
+      if (requests.get(pending.request.id) !== pending) return
       cleanup(pending)
-      requests.delete(pending.id)
-      void registration.events.emit("cancelled", { id: pending.id }).catch(() => {})
+      requests.delete(pending.request.id)
       pending.reject(new Error(message))
     }
 
-    async function waitForTerminal(
+    function waitForTerminal(
       request: TerminalRequest,
-      timeoutMs: number,
       signal: AbortSignal,
     ): Promise<TerminalResult> {
       let pending!: Pending
-      const result = new Promise<TerminalResult>((resolveResult, rejectResult) => {
+      return new Promise<TerminalResult>((resolveResult, rejectResult) => {
         pending = {
-          id: request.id,
-          timeoutMs,
+          request,
           startTimer: setTimeout(() => {
             fail(
               pending,
@@ -115,22 +113,13 @@ export default Plugin.define({
         if (signal.aborted) pending.onAbort()
         else signal.addEventListener("abort", pending.onAbort, { once: true })
       })
-
-      if (requests.has(request.id)) {
-        try {
-          await registration.events.emit("requested", { ...request })
-        } catch (error) {
-          fail(pending, `Could not request an interactive terminal: ${String(error)}`)
-        }
-      }
-      return result
     }
 
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "interactive_terminal",
         description:
-          "Run an executable with an argument array in a floating terminal on the user's machine. Use this for sudo, password prompts, MFA, interactive installers, and full-screen terminal programs. The user types input directly; never put passwords or other secrets in command or args. The tool waits for the command to exit, then returns its captured stdout/stderr and exit code. No shell is implied: use sh -lc explicitly only when shell syntax is needed.",
+          "Run an executable with an argument array in a floating terminal on the user's machine. Use this for sudo, password prompts, MFA, interactive installers, and full-screen terminal programs. The user types input directly; never put passwords or other secrets in command or args. The tool waits for the command to exit, then returns captured terminal output and its exit code. Password prompts normally disable echo, but echoed input and any secrets printed by the command are included in the output. No shell is implied: use sh -lc explicitly only when shell syntax is needed.",
         input: {
           type: "object",
           properties: {
@@ -158,22 +147,37 @@ export default Plugin.define({
           const input = raw as ToolInput
           const args = input.args ?? []
           const rendered = displayCommand(input.command, args)
-          const cwd = isAbsolute(input.cwd ?? "")
-            ? input.cwd!
-            : resolve(ctx.location.directory, input.cwd ?? ".")
+          const requestedCwd = resolve(ctx.location.directory, input.cwd ?? ".")
+          const scanned = await scanPermissions(rendered, requestedCwd, [
+            ctx.location.directory,
+            ctx.location.project.canonical,
+          ])
+          if (scanned.commands.length === 0) {
+            throw new Error("OpenCode's shell scanner did not produce a command to authorize.")
+          }
+          const source = {
+            type: "tool" as const,
+            messageID: context.messageID,
+            id: context.id,
+          }
 
+          if (scanned.externalDirectories.length > 0) {
+            await ctx.permission.assert({
+              sessionID: context.sessionID,
+              agent: context.agent,
+              source,
+              action: "external_directory",
+              resources: scanned.externalDirectories,
+              metadata: { interactive: true, cwd: scanned.cwd },
+            })
+          }
           await ctx.permission.assert({
             sessionID: context.sessionID,
             agent: context.agent,
-            source: {
-              type: "tool",
-              messageID: context.messageID,
-              id: context.id,
-            },
+            source,
             action: "shell",
-            resources: [rendered],
-            save: [rendered],
-            metadata: { interactive: true, cwd },
+            resources: scanned.commands,
+            metadata: { interactive: true, cwd: scanned.cwd },
           })
 
           await context.progress({ status: "waiting for the interactive terminal" })
@@ -183,17 +187,17 @@ export default Plugin.define({
               id: randomUUID(),
               command: input.command,
               args,
-              cwd,
+              cwd: scanned.cwd,
               title: `OpenCode: ${input.command}`,
+              timeoutMs: timeout * 1000,
             },
-            timeout * 1000,
             context.signal,
           )
           await context.progress({ status: "interactive terminal closed" })
 
           const lines = [
             `Command: ${rendered}`,
-            `Working directory: ${cwd}`,
+            `Working directory: ${scanned.cwd}`,
             result.exitCode === null ? "Exit code: unknown" : `Exit code: ${result.exitCode}`,
             `Duration: ${(result.durationMs / 1000).toFixed(1)}s`,
           ]
@@ -206,11 +210,9 @@ export default Plugin.define({
     })
 
     return () => {
-      for (const pending of requests.values()) {
-        cleanup(pending)
-        pending.reject(new Error("Interactive terminal plugin unloaded."))
+      for (const pending of [...requests.values()]) {
+        fail(pending, "Interactive terminal plugin unloaded.")
       }
-      requests.clear()
     }
   },
 })

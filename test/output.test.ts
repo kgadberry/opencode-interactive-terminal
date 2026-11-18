@@ -35,6 +35,13 @@ test("resolveTerminal uses the Kitty preset from TERMINAL", () => {
   })
 })
 
+test("WezTerm uses a new process so the launcher waits for completion", () => {
+  assert.deepEqual(resolveTerminal({}, { TERMINAL: "wezterm" }), {
+    command: "wezterm",
+    args: ["start", "--always-new-process", "--"],
+  })
+})
+
 test("resolveTerminal accepts an explicit terminal command", () => {
   const terminal = { command: "wezterm", args: ["start", "--"] }
   assert.deepEqual(resolveTerminal({ terminal }), terminal)
