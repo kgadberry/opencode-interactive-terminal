@@ -40,6 +40,23 @@ interface ParsedCommands {
   directories: string[]
 }
 
+type PermissionScanner = (
+  command: string,
+  shell: string,
+  cwd: string,
+) => ReturnType<typeof ShellParse.scan>
+
+export function selectPermissionScanner(parser: {
+  scanPortable?: PermissionScanner
+  scan?: PermissionScanner
+}): PermissionScanner {
+  // Core 2.2 exposes a portable entry point alongside scan. In Core 2.3,
+  // scan itself is the portable entry point. Never retry a rejected scan.
+  if (typeof parser.scanPortable === "function") return parser.scanPortable
+  if (typeof parser.scan === "function") return parser.scan
+  throw new Error("The installed @opencode/core has no supported shell permission scanner.")
+}
+
 type Dialect = "bash" | "zsh" | "posix"
 
 interface EmbeddedScript {
@@ -85,7 +102,8 @@ async function scanCommands(
   depth = 0,
 ): Promise<ParsedCommands> {
   if (depth > 10) throw new Error("Embedded shell command nesting exceeds the scanner limit.")
-  const parsed = await Effect.runPromise(ShellParse.scanPortable(command, shell, cwd))
+  const scan = selectPermissionScanner(ShellParse)
+  const parsed = await Effect.runPromise(scan(command, shell, cwd))
   const nested = await Promise.all(
     embeddedScripts(command, shell).map((script) =>
       scanCommands(script.text, cwd, script.shell, depth + 1),

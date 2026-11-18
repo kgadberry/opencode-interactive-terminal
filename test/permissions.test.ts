@@ -4,7 +4,38 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 
-import { displayCommand, scanPermissions } from "../src/permissions.ts"
+import { Effect } from "effect"
+
+import { displayCommand, scanPermissions, selectPermissionScanner } from "../src/permissions.ts"
+
+test("the scanner adapter selects the portable entry point on each supported Core API", async () => {
+  const result = { commands: [{ resource: "printf ok", save: "printf *" }], directories: [] }
+  const scan = (command: string, shell: string, cwd: string) => {
+    assert.deepEqual([command, shell, cwd], ["printf ok", "zsh", "/project"])
+    return Effect.succeed(result)
+  }
+  const notPortable = () => assert.fail("Core 2.2 should use scanPortable")
+  for (const api of [{ scanPortable: scan, scan: notPortable }, { scan }]) {
+    const selected = selectPermissionScanner(api)
+    assert.deepEqual(await Effect.runPromise(selected("printf ok", "zsh", "/project")), result)
+  }
+})
+
+test("a missing scanner or a rejected scan stops without using another parser", async () => {
+  assert.throws(() => selectPermissionScanner({}), /no supported shell permission scanner/)
+  const parser = selectPermissionScanner({
+    scanPortable: () => Effect.fail(new Error("opaque command")),
+    scan: () => assert.fail("a rejected scan must not fall back"),
+  })
+  await assert.rejects(Effect.runPromise(parser("printf ok", "sh", "/project")), /opaque command/)
+})
+
+test("literal command preflight produces a shell permission resource", async () => {
+  const command = displayCommand("printf", ["%s", "floating-terminal-smoke"])
+  const result = await scanPermissions(command, process.cwd(), [process.cwd()])
+  assert.deepEqual(result.commands, [command])
+  assert.deepEqual(result.externalDirectories, [])
+})
 
 test("permission scanning includes commands nested in sh -lc", async () => {
   const command = displayCommand("sh", ["-lc", "printf ok; rm -- '*'"])
