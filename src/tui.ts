@@ -6,8 +6,11 @@ import { InteractiveTerminal } from "./rpc.ts"
 import type { PendingTerminalRequest, TerminalRequest, TerminalResult } from "./rpc.ts"
 import { resolveTerminal, runInTerminal } from "./terminal.ts"
 
+type TerminalLocation = { directory: string }
+
 interface ActiveRequest {
   controller: AbortController
+  location: TerminalLocation
   claimed: boolean
   timeout?: NodeJS.Timeout
   result?: TerminalResult
@@ -32,6 +35,7 @@ export default Plugin.define({
 
     // The generated client changes after a server restart; resolve it at call time.
     const rpc = () => context.client.rpc(InteractiveTerminal)
+    const currentDirectory = () => context.location?.directory ?? context.data.location.default()?.directory
 
     function showError(error: unknown): void {
       if (stopping) return
@@ -43,16 +47,14 @@ export default Plugin.define({
       })
     }
 
-    async function complete(id: string, result: TerminalResult): Promise<boolean> {
-      const response = (await rpc().complete({ id, client, ...result })) as { accepted: boolean }
-      return response.accepted
-    }
-
     async function deliver(id: string, state: ActiveRequest): Promise<void> {
       if (!state.result || state.delivering || state.delivered || stopping) return
       state.delivering = true
       try {
-        const accepted = await complete(id, state.result)
+        const { accepted } = (await rpc().complete(
+          { id, client, ...state.result },
+          { location: state.location },
+        )) as { accepted: boolean }
         state.delivered = true
         active.delete(id)
         if (accepted) {
@@ -72,10 +74,11 @@ export default Plugin.define({
       }
     }
 
-    async function run(request: TerminalRequest): Promise<void> {
+    async function run(request: TerminalRequest, location: TerminalLocation): Promise<void> {
       if (active.has(request.id)) return
       const state: ActiveRequest = {
         controller: new AbortController(),
+        location,
         claimed: false,
         delivering: false,
         delivered: false,
@@ -83,7 +86,7 @@ export default Plugin.define({
       active.set(request.id, state)
 
       try {
-        const claim = (await rpc().claim({ id: request.id, client })) as { claimed: boolean }
+        const claim = (await rpc().claim({ id: request.id, client }, { location })) as { claimed: boolean }
         if (!claim.claimed) return
         state.claimed = true
         if (stopping || state.controller.signal.aborted) {
@@ -134,16 +137,18 @@ export default Plugin.define({
       }
     }
 
-    async function reconcile(): Promise<void> {
-      if (stopping || reconciling) return
-      reconciling = true
+    async function reconcileLocation(location: TerminalLocation, acceptNew: boolean): Promise<void> {
       try {
-        const response = (await rpc().pending({})) as { requests: PendingTerminalRequest[] }
+        const response = (await rpc().pending({}, { location })) as { requests: PendingTerminalRequest[] }
+        if (stopping) return
         const present = new Set(response.requests.map((request) => request.id))
-        for (const request of response.requests) {
-          if (!request.claimed && !active.has(request.id)) void run(request)
+        if (acceptNew && currentDirectory() === location.directory) {
+          for (const request of response.requests) {
+            if (!request.claimed && !active.has(request.id)) void run(request, location)
+          }
         }
         for (const [id, state] of active) {
+          if (state.location.directory !== location.directory) continue
           if (!present.has(id)) {
             if (state.result) active.delete(id)
             else state.controller.abort()
@@ -153,6 +158,21 @@ export default Plugin.define({
         }
       } catch {
         // Keep running commands and buffered results; local deadlines still apply.
+      }
+    }
+
+    async function reconcile(): Promise<void> {
+      if (stopping || reconciling) return
+      reconciling = true
+      try {
+        // Without an explicit location the server uses its own default directory.
+        // Keep polling in-flight commands in their original location after a tab change.
+        const current = currentDirectory()
+        const directories = new Set([...active.values()].map((state) => state.location.directory))
+        if (current) directories.add(current)
+        await Promise.all([...directories].map((directory) =>
+          reconcileLocation({ directory }, directory === current),
+        ))
       } finally {
         reconciling = false
       }
