@@ -13,21 +13,21 @@ let tailStart = 0
 let total = 0
 let interrupted = false
 
-for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) {
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
     interrupted = true
     process.stdin.destroy()
   })
 }
 
-function orderedTail(): Buffer {
+function orderedTail() {
   if (tailLength < tailLimit || tailStart === 0) return tail.subarray(0, tailLength)
   return Buffer.concat([tail.subarray(tailStart), tail.subarray(0, tailStart)])
 }
 
 try {
   for await (const value of process.stdin) {
-    const chunk: Buffer = Buffer.isBuffer(value) ? value : Buffer.from(value)
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
     total += chunk.length
 
     if (!process.stdout.write(chunk)) await once(process.stdout, "drain")
@@ -60,7 +60,7 @@ try {
 
 const bufferedTail = orderedTail()
 const truncated = total > limit
-let captured: Buffer
+let captured
 if (truncated) {
   const omitted = total - headLength - tailLength
   captured = Buffer.concat([

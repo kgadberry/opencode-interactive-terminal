@@ -1,18 +1,22 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { once } from "node:events"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import test from "node:test"
 
-const collector = fileURLToPath(new URL("../src/collector.ts", import.meta.url))
+const collector = fileURLToPath(new URL("../src/collector.mjs", import.meta.url))
 
-test("collector handles many one-byte writes with ordered bounded output", async () => {
+test("installed Node collector handles many one-byte writes with ordered bounded output", async () => {
   const directory = await mkdtemp(join(tmpdir(), "terminal-collector-"))
+  const installed = join(directory, "node_modules", "opencode-interactive-terminal", "src")
+  await mkdir(installed, { recursive: true })
+  const entry = join(installed, "collector.mjs")
+  await copyFile(collector, entry)
   const output = join(directory, "output")
-  const child = spawn(process.execPath, [collector, output, "4096"], {
+  const child = spawn(process.execPath, [entry, output, "4096"], {
     stdio: ["pipe", "ignore", "pipe"],
   })
   let errors = ""

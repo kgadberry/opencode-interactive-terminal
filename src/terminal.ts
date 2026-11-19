@@ -15,7 +15,8 @@ export interface TerminalSpec {
 }
 
 const runner = fileURLToPath(new URL("./runner.sh", import.meta.url))
-const collector = fileURLToPath(new URL("./collector.ts", import.meta.url))
+// Node refuses to strip TypeScript when the installed package lives under node_modules.
+const collector = fileURLToPath(new URL("./collector.mjs", import.meta.url))
 
 const presets: Record<string, string[]> = {
   kitty: ["--class", "opencode-interactive-terminal", "--title", "{title}"],
