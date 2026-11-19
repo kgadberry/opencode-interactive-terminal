@@ -50,6 +50,7 @@ Load both the server and TUI parts by adding the package to `opencode.json(c)`:
 
 Replace `COMMIT_SHA` with a full commit hash for a pinned installation. For a checkout, use an absolute local package path instead.
 The plugin pins its own Core and Effect versions in `package.json`; a Git installation can resolve those dependencies separately from both the running OpenCode binary and the checkout's npm lockfile.
+Solid is a runtime dependency because the TUI SDK imports it, even though the plugin itself does not render JSX.
 
 If `terminal` is omitted, the plugin recognizes `$TERMINAL` or `$TERM_PROGRAM` and selects a preset. `{title}` in terminal arguments expands to the current command title. The plugin appends this invocation to the configured terminal command:
 
